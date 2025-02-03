@@ -1,0 +1,16 @@
+# Python virtual environment
+.venv/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Configuration files
+Config.py
+*.ini
+*.cfg
+
+# IDE specific files
+.vscode/
+*.code-workspace
