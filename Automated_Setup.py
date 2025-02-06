@@ -17,11 +17,10 @@ def get_debug_user_input():
     while True:
         user_input = input("Create a debug user on the new server? (y/n): ").strip().lower()
         if user_input in ['y', 'n']:
-            return user_input
+            add_debug_user = user_input
+            return add_debug_user
         else:
             print("Invalid input. Please enter 'y' or 'n'.")
-
-add_debug_user = get_debug_user_input()
 
 def user_exists(SSH, username):
     stdout = SSH.exec_command(f"getent passwd {username}")
@@ -38,6 +37,7 @@ def cmd_output(stdout, stderr):
     print("Output: ", output)
     print("Error: ", error)
 
+
 def ssh_connect(SSH, hostname, username, key_path, password=None):
     try:
         # Try RSA key without passphrase first
@@ -45,13 +45,21 @@ def ssh_connect(SSH, hostname, username, key_path, password=None):
         SSH.connect(hostname=hostname, 
                    username=username, 
                    pkey=private_key)
+    except FileNotFoundError:
+        print("File not found. Please check the path to the key file.")
+        raise
+
     except (pmk.ssh_exception.PasswordRequiredException, pmk.ssh_exception.SSHException):
         print("No passphrase-less key found or invalid key format. Trying with passphrase.")
         try:
             # Try RSA key with passphrase
-            passphrase = input("Enter the SSH key pass: (Leave blank to proceed to password auth)")
+            passphrase = input("Enter the SSH key pass: (Leave blank to proceed to password auth): ")
             if passphrase:
                 private_key = pmk.RSAKey.from_private_key_file(key_path, password=passphrase)
+                SSH.connect(hostname=hostname, 
+                           username=username,
+                           pkey=private_key)
+                print("Connected using RSA key with passphrase.")
             else:
                 private_key = pmk.RSAKey.from_private_key_file(key_path)
                 print("No passphrase provided")
@@ -67,8 +75,9 @@ def ssh_connect(SSH, hostname, username, key_path, password=None):
             print("Authentication failed.")
             raise
 
+
 # Function to execute a command if sudo password required
-def exec_sudo_cmd(SSH, cmd, passwd = sudo_password):
+def exec_sudo_cmd(SSH, cmd):
     print(f"Executing command: {cmd}")
     
     # Check to see if sudo is required
@@ -77,6 +86,7 @@ def exec_sudo_cmd(SSH, cmd, passwd = sudo_password):
     error = stderr.read().decode()
 
     if 'permission denied' in error.lower() or 'sudo:' in error.lower():
+        print(error) # Debugging
         passwd = input("Enter the sudo password: ")
         
         command = f"sudo -S -p '' {cmd}"
@@ -96,14 +106,16 @@ def exec_sudo_cmd(SSH, cmd, passwd = sudo_password):
         sudo_password = passwd
         print(f"Executed sudo command: {command}")  # Debugging statement  
         cmd_output(stdout, stderr) # Debugging statement
+
+        return stdin, stdout, stderr, sudo_password
     else:
         print(f"No sudo needed")
-
-    return stdin, stdout, stderr
+        return stdin, stdout, stderr
 
 
 # Function to create a debug user
-def create_debug_user():    
+def create_debug_user():
+
     if add_debug_user == 'y':
         if not user_exists(SSH, "debug"):
             password = input("Input a password for the debug user: ")
@@ -122,12 +134,13 @@ def create_debug_user():
     else:
         print("User 'debug' already exists.")
 
+
 # Function to move the wireguard config and enable the systemd service
 def mv_cfg_en_serv():
 
     # Move files to new server
     SCP = SCPClient(SSH.get_transport())
-    SCP.put(f'{newname}.conf', f'~/{newname}.conf')
+    SCP.put(f'tmp/{newname}.conf', f'~/{newname}.conf')
     SCP.put('wg-quick@wg0.service', '~/')
     SCP.close()
 
@@ -136,16 +149,19 @@ def mv_cfg_en_serv():
         os.remove(f'{newname}.conf')
     else:
         print("Cannot remove non-existent file.")
-    
+
+    # TODO: Add check for existing wireguard config and ask if user wants to overwrite or create new conf name
     # Execute Commands on new server
     exec_sudo_cmd(SSH, "apt update && apt upgrade -y && apt-get install -y wireguard")
-    exec_sudo_cmd(SSH, f'if [ ! -f /etc/wireguard/wg0.conf ]; then mv {newname}.conf /etc/wireguard/wg0.conf; else echo "File wg0.conf already exists"; fi')
+    exec_sudo_cmd(SSH, f"mv ~/{newname}.conf /etc/wireguard/wg0.conf")
     exec_sudo_cmd(SSH, "mv ~/wg-quick@wg0.service /etc/systemd/system/wg-quick@wg0.service")
     exec_sudo_cmd(SSH, "systemctl enable wg-quick@wg0.service")
     exec_sudo_cmd(SSH, "systemctl start wg-quick@wg0.service")
 
 
 def main():
+    # TODO: Add sudo compatibility for all possible sudo commands on vpn server
+
     # SSH to VPN server
     sudo_password = None
     ssh_connect(SSH, cfg.HOST, cfg.USERNAME, cfg.KEY_PATH)
@@ -164,15 +180,15 @@ def main():
 
             # Store the VPN config
             SCP = SCPClient(SSH.get_transport())
-            SCP.get(f'~/configs/{newname}.conf', f'{newname}.conf')
+            SCP.get(f'~/configs/{newname}.conf', f'tmp/{newname}.conf')
             SCP.close()
             sudo_password = None
 
             # Add PersistentKeepalive to newname.conf locally if not already present
-            with open(f'{newname}.conf', 'r+') as file:
+            with open(f'tmp/{newname}.conf', 'r+') as file:
                 lines = file.readlines()
                 if not lines[-1].strip().startswith('PersistentKeepalive'):
-                    file.write('\nPersistentKeepalive = 25\n')
+                    file.write('PersistentKeepalive = 25\n')
 
             # SSH to new server
             SSH.close()
@@ -194,16 +210,16 @@ def main():
         cmd_output(stdout, stderr)
 
         # Add PersistentKeepalive to wg0.conf above the last line
-        stdin, stdout, stderr = SSH.exec_command("sudo sed -i '$i PersistentKeepalive = 25' /etc/wireguard/wg0.conf")
+        stdin, stdout, stderr = exec_sudo_cmd(SSH, "sed -i '$i PersistentKeepalive = 25' /etc/wireguard/wg0.conf")
         cmd_output(stdout, stderr)
 
         # Store the VPN config
         SCP = SCPClient(SSH.get_transport())
-        SCP.get(f'~/configs/{newname}.conf', f'{newname}.conf')
+        SCP.get(f'~/configs/{newname}.conf', f'tmp/{newname}.conf')
         SCP.close()
 
         # Add PersistentKeepalive to newname.conf locally
-        with open(f'{newname}.conf', 'a') as file:
+        with open(f'tmp/{newname}.conf', 'a') as file:
             file.write('PersistentKeepalive = 25\n')
 
         # SSH to new server
