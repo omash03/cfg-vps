@@ -37,64 +37,109 @@ def cmd_output(stdout, stderr):
     print("Output: ", output)
     print("Error: ", error)
 
-
+# Probably didn't need to support multiple key types, but I was bored
 def ssh_connect(SSH, hostname, username, key_path, password=None):
-    try:
-        # Try RSA key without passphrase first
-        private_key = pmk.RSAKey.from_private_key_file(key_path)
-        SSH.connect(hostname=hostname, 
-                   username=username, 
-                   pkey=private_key)
-    except FileNotFoundError:
-        print("File not found. Please check the path to the key file.")
-        raise
-
-    except (pmk.ssh_exception.PasswordRequiredException, pmk.ssh_exception.SSHException):
-        print("No passphrase-less key found or invalid key format. Trying with passphrase.")
+    print(f"Attempting to connect to {hostname} as {username}...")
+    
+    # Try different key types in order: ED25519 (modern) first, then RSA
+    key_types = [
+        {"class": pmk.Ed25519Key, "name": "ED25519"},
+        {"class": pmk.RSAKey, "name": "RSA"}
+    ]
+    
+    # First try without passphrase
+    for key_type in key_types:
         try:
-            # Try RSA key with passphrase
-            passphrase = input("Enter the SSH key pass: (Leave blank to proceed to password auth): ")
-            if passphrase:
-                private_key = pmk.RSAKey.from_private_key_file(key_path, password=passphrase)
+            print(f"Trying {key_type['name']} key without passphrase...")
+            private_key = key_type["class"].from_private_key_file(key_path)
+            SSH.connect(hostname=hostname, 
+                       username=username, 
+                       pkey=private_key)
+            print(f"Connected using {key_type['name']} key without passphrase.")
+            return True
+        except FileNotFoundError:
+            print(f"Key file not found: {key_path}")
+            raise
+        except (pmk.ssh_exception.PasswordRequiredException):
+            print(f"{key_type['name']} key requires passphrase.")
+            continue
+        except pmk.ssh_exception.SSHException as e:
+            print(f"Failed with {key_type['name']} key: {str(e)}")
+            continue
+        except Exception as e:
+            print(f"Unexpected error with {key_type['name']} key: {str(e)}")
+            continue
+    
+    # If we're here, no key worked without passphrase
+    # Try again with passphrase
+    passphrase = input("Enter SSH key passphrase (leave blank for password auth): ")
+    if passphrase:
+        for key_type in key_types:
+            try:
+                print(f"Trying {key_type['name']} key with passphrase...")
+                private_key = key_type["class"].from_private_key_file(key_path, password=passphrase)
                 SSH.connect(hostname=hostname, 
                            username=username,
                            pkey=private_key)
-                print("Connected using RSA key with passphrase.")
-            else:
-                private_key = pmk.RSAKey.from_private_key_file(key_path)
-                print("No passphrase provided")
-                exit()
-
-        except (pmk.ssh_exception.PasswordRequiredException, pmk.ssh_exception.SSHException):
-            print("Invalid passphrase or key format. Trying password authentication.")
-            password = input("Enter the SSH password: ")
-            SSH.connect(hostname=hostname, 
-                      username=username, 
-                      password=password)
-        except pmk.ssh_exception.AuthenticationException:
-            print("Authentication failed.")
-            raise
+                print(f"Connected using {key_type['name']} key with passphrase.")
+                return True
+            except pmk.ssh_exception.AuthenticationException:
+                print(f"Invalid passphrase for {key_type['name']} key.")
+                continue
+            except pmk.ssh_exception.SSHException as e:
+                print(f"Failed with {key_type['name']} key: {str(e)}")
+                continue
+            except Exception as e:
+                print(f"Unexpected error with {key_type['name']} key: {str(e)}")
+                continue
+    
+    # If key authentication failed, try password
+    try:
+        password = password or input("Enter SSH password: ")
+        SSH.connect(hostname=hostname, 
+                  username=username, 
+                  password=password)
+        print("Connected using password authentication.")
+        return True
+    except pmk.ssh_exception.AuthenticationException:
+        print("Authentication failed with all methods.")
+        raise
+    except Exception as e:
+        print(f"Unexpected error during password auth: {str(e)}")
+        raise
 
 
 # Function to execute a command if sudo password required
 def exec_sudo_cmd(SSH, cmd):
     print(f"Executing command: {cmd}")
     
-    # Check to see if sudo is required
-    SSH.exec_command(cmd)
-    stdin, stdout, stderr = SSH.exec_command(cmd)
-    error = stderr.read().decode()
+    try:
+        # Execute command without sudo password first
+        command = f"sudo -n {cmd}"
+        stdin, stdout, stderr = SSH.exec_command(command)
+        output = stdout.read().decode()
+        error = stderr.read().decode()
+        
+        # If successful, no password needed
+        if not ('sudo: a password is required' in error):
+            print(f"Command executed without sudo password")
+            return stdin, stdout, stderr
+        
+        # If we reach here, sudo password is required
+        raise Exception("Sudo password required")
 
-    if 'permission denied' in error.lower() or 'sudo:' in error.lower():
+    except Exception:
         print(error) # Debugging
-        passwd = input("Enter the sudo password: ")
+        passwd = input("Enter the sudo password (leave blank if not needed): ")
         
         command = f"sudo -S -p '' {cmd}"
         stdin, stdout, stderr = SSH.exec_command(command, get_pty=True)
 
-        # Send the sudo password followed by a newline
-        stdin.write(f'{passwd}\n')
-        stdin.flush()
+        # Only send password if one was provided
+        if passwd:
+            stdin.write(f'{passwd}\n')
+            stdin.flush()
+            
         error = stderr.read().decode()
         # Check for incorrect password or command failure
         if 'incorrect password' in error.lower() or 'sudo:' in error.lower():
@@ -107,9 +152,6 @@ def exec_sudo_cmd(SSH, cmd):
         print(f"Executed sudo command: {command}")  # Debugging statement  
         cmd_output(stdout, stderr) # Debugging statement
 
-        return stdin, stdout, stderr, sudo_password
-    else:
-        print(f"No sudo needed")
         return stdin, stdout, stderr
 
 
@@ -152,7 +194,7 @@ def mv_cfg_en_serv():
 
     # TODO: Add check for existing wireguard config and ask if user wants to overwrite or create new conf name
     # Execute Commands on new server
-    exec_sudo_cmd(SSH, "apt update && apt upgrade -y && apt-get install -y wireguard")
+    exec_sudo_cmd(SSH, "apt update && apt upgrade -y && apt install -y wireguard && apt install -y resolvconf")
     exec_sudo_cmd(SSH, f"mv ~/{newname}.conf /etc/wireguard/wg0.conf")
     exec_sudo_cmd(SSH, "mv ~/wg-quick@wg0.service /etc/systemd/system/wg-quick@wg0.service")
     exec_sudo_cmd(SSH, "systemctl enable wg-quick@wg0.service")
